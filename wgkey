@@ -1,0 +1,245 @@
+#!/usr/bin/env python3
+
+__version__ = '1.0.0'
+
+import os
+import sys
+import stat
+import json
+import textwrap
+import subprocess
+import click
+
+CONFIG_PATH = '/etc/wireguard/wg0.conf'
+DATA_PATH = '/etc/wgkey.conf'
+
+def genip(prefix, prefix6, number, subnet):
+    if prefix6 is not None:
+        if subnet is True:
+            return (f'{prefix}{number}/24, {prefix6}{number}/64')
+        return (f'{prefix}{number}/32, {prefix6}{number}/128')
+    if subnet is True:
+        return f'{prefix}{number}/24'
+    return f'{prefix}{number}/32'
+
+
+def save(data):
+    with open(DATA_PATH, 'w') as f:
+        json.dump(data, f)
+    os.chmod(DATA_PATH, 0o600)
+    if 'key' not in data:
+        return
+    output = data['output']
+    key = data['key']
+    port = data['port']
+    prefix = data['prefix']
+    prefix6 = data['prefix6']
+    output = data['output']
+    ip = genip(prefix, prefix6, 1, True)
+    with open(CONFIG_PATH, 'w') as f:
+        f.write(textwrap.dedent(f'''\
+            [Interface]
+            ListenPort = {port}
+            Address = {ip}
+            PrivateKey = {key}
+            PostUp =    iptables -A INPUT -i %i -j ACCEPT
+            PostUp =   ip6tables -A INPUT -i %i -j ACCEPT
+            PostUp =    iptables -A FORWARD -i %i -j ACCEPT
+            PostUp =   ip6tables -A FORWARD -i %i -j ACCEPT
+            PostUp =    iptables -t nat -A POSTROUTING -o {output} -j MASQUERADE
+            PostUp =   ip6tables -t nat -A POSTROUTING -o {output} -j MASQUERADE
+            PostUp =    iptables -D INPUT -i %i -j ACCEPT
+            PostUp =   ip6tables -D INPUT -i %i -j ACCEPT
+            PostDown=   iptables -D FORWARD -i %i -j ACCEPT
+            PostDown=  ip6tables -D FORWARD -i %i -j ACCEPT
+            PostDown=   iptables -t nat -D POSTROUTING -o {output} -j MASQUERADE
+            PostDown=  ip6tables -t nat -D POSTROUTING -o {output} -j MASQUERADE
+            '''))
+        for name, client in data['clients'].items():
+            pub = client['pub']
+            psk = client['psk']
+            ip = genip(prefix, prefix6, client['ip'], False)
+            f.write('\n')
+            f.write(textwrap.dedent(f'''\
+                [Peer]
+                # {name}
+                PublicKey = {pub}
+                PresharedKey = {psk}
+                AllowedIPs = {ip}
+                '''))
+    subprocess.run(['systemctl', 'restart', 'wg-quick@wg0.service'])
+
+
+def genkey():
+    key = subprocess.run(['wg', 'genkey'], stdout=subprocess.PIPE, check=True).stdout
+    pub = subprocess.run(['wg', 'pubkey'], input=key, stdout=subprocess.PIPE, check=True).stdout
+    return (key.decode('ASCII').strip(), pub.decode('ASCII').strip())
+
+
+def genpsk():
+    return subprocess.run(['wg', 'genpsk'], stdout=subprocess.PIPE, check=True).stdout.decode('ASCII').strip()
+
+
+@click.group()
+@click.pass_context
+def wgkey(ctx):
+    '''Basic program to manage a WireGuard proxy server'''
+    ctx.ensure_object(dict)
+    try:
+        with open(DATA_PATH, 'r') as f:
+            ctx.obj = json.load(f)
+    except FileNotFoundError:
+        pass
+    if 'clients' not in ctx.obj:
+        ctx.obj['clients'] = {}
+
+
+@wgkey.command()
+@click.argument('endpoint')
+@click.argument('port')
+@click.option('--prefix', default='10.0.0.', help='IPv4 address allocation prefix')
+@click.option('--prefix6', default='fd10:1010::', help='IPv6 address allocation prefix')
+@click.option('--output', default='eth0', help='Output network device to link to')
+@click.option('--dns', multiple=True, default=[], help='DNS server(s) to use')
+@click.pass_context
+def reset(ctx, endpoint, port, prefix, prefix6, output, dns):
+    '''Configures server using wireguard tools'''
+    click.confirm('Reset server? All clients would need to be reconfigured.', abort=True)
+    key, pub = genkey()
+    ctx.obj['key'] = key
+    ctx.obj['pub'] = pub
+    ctx.obj['output'] = output
+    ctx.obj['prefix'] = prefix
+    ctx.obj['prefix6'] = prefix6
+    ctx.obj['port'] = port
+    ctx.obj['endpoint'] = endpoint
+    if isinstance(dns, tuple):
+        dns = [*dns]
+    if len(dns) == 0:
+        dns.append(f'{prefix}1')
+        if prefix6 is not None:
+            dns.append(f'{prefix6}1')
+    ctx.obj['dns'] = dns
+    save(ctx.obj)
+
+
+@wgkey.command()
+@click.option('--output', default=None, help='Output network device to link to')
+@click.option('--dns', multiple=True, default=[], help='DNS server(s) to use')
+@click.pass_context
+def update(ctx, output, dns):
+    '''Update existing configuration and regenerate server files'''
+    if output is not None:
+        ctx.obj['output'] = output
+    if isinstance(dns, tuple):
+        dns = [*dns]
+    if len(dns) > 0:
+        ctx.obj['dns'] = dns
+    save(ctx.obj)
+
+
+@wgkey.command()
+@click.argument('name')
+@click.pass_context
+def add(ctx, name):
+    '''Creates a new client'''
+    if name in ctx.obj['clients']:
+        print(name, 'is already in use', file=sys.stderr)
+        exit(-1)
+    use_ip = None
+    ip = 2
+    while use_ip is None:
+        use_ip = ip
+        for client in ctx.obj['clients'].values():
+            if client['ip'] == use_ip:
+                use_ip = None
+                break
+        ip += 1
+        if ip >= 256:
+            print('client limit reached', file=sys.stderr)
+            exit(-1)
+    key, pub = genkey()
+    psk = genpsk()
+    ctx.obj['clients'][name] = {
+        'ip': use_ip,
+        'key': key,
+        'pub': pub,
+        'psk': psk,
+    }
+    save(ctx.obj)
+
+@wgkey.command()
+@click.pass_context
+def list(ctx):
+    '''Lists clients'''
+    prefix = ctx.obj['prefix']
+    prefix6 = ctx.obj.get('prefix6')
+    for name, client in ctx.obj['clients'].items():
+        pub = client['pub']
+        ip = genip(prefix, prefix6, client['ip'], True)
+        print(' | '.join([name, pub, ip]))
+
+
+@wgkey.command()
+@click.argument('name')
+@click.pass_context
+def remove(ctx, name):
+    '''Removes an existing client'''
+    if name not in ctx.obj['clients']:
+        print(name, 'not found', file=sys.stderr)
+        exit(-1)
+    ctx.obj['clients'].pop(name)
+    save(ctx.obj)
+
+
+@wgkey.command()
+@click.option('--dns', multiple=True, default=[], help='Custom DNS server(s) to use')
+@click.option('--port', default=None, help='Custom port number to use')
+@click.option('--endpoint', default=None, help='Custom endpoint to use')
+@click.argument('name')
+@click.pass_context
+def configure(ctx, dns, port, endpoint, name):
+    '''Generates configuration file for provisioning clients'''
+    if 'prefix' not in ctx.obj:
+        print('server not configured', file=sys.stderr)
+        exit(-1)
+    if name not in ctx.obj['clients']:
+        print(name, 'not found', file=sys.stderr)
+        exit(-1)
+    if isinstance(dns, tuple):
+        dns = [*dns]
+    if len(dns) == 0:
+        dns = ctx.obj['dns']
+    if port is None:
+        port = ctx.obj['port']
+    if endpoint is None:
+        endpoint = ctx.obj['endpoint']
+    prefix = ctx.obj['prefix']
+    prefix6 = ctx.obj.get('prefix6')
+    pub = ctx.obj['pub']
+    client = ctx.obj['clients'][name]
+    key = client['key']
+    psk = client['psk']
+    ip = genip(prefix, prefix6, client['ip'], True)
+    print(textwrap.dedent(f'''\
+        [Interface]
+        Address = {ip}
+        PrivateKey = {key}
+        ''').strip())
+
+    for ip in dns:
+        print(f'DNS = {ip}')
+    print()
+
+    print(textwrap.dedent(f'''\
+        [Peer]
+        PublicKey = {pub}
+        PresharedKey = {psk}
+        AllowedIPs = 0.0.0.0/0, ::/0
+        Endpoint = {endpoint}:{port}
+        '''))
+
+
+if __name__ == '__main__':
+    wgkey()
+
